@@ -1,0 +1,27 @@
+{
+  "name": "amocrm-spam-checker",
+  "version": "1.0.0",
+  "description": "Проверка звонков на спам через SpravPortal API для amoCRM",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "keywords": [
+    "amocrm",
+    "spam",
+    "spravportal",
+    "webhook"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
+
