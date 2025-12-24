@@ -623,6 +623,52 @@ app.get('/test/check', async (req, res) => {
 });
 
 /**
+ * Получить список воронок и статусов из amoCRM
+ * GET /api/pipelines
+ */
+app.get('/api/pipelines', async (req, res) => {
+  try {
+    if (!config.amocrm.accessToken) {
+      return res.status(400).json({ error: 'AMOCRM_ACCESS_TOKEN не настроен' });
+    }
+    
+    const response = await axios.get(
+      `${config.amocrm.domain}/api/v4/leads/pipelines`,
+      {
+        headers: {
+          'Authorization': `Bearer ${config.amocrm.accessToken}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 10000
+      }
+    );
+    
+    const pipelines = response.data._embedded?.pipelines || [];
+    
+    const result = pipelines.map(pipeline => ({
+      pipeline_id: pipeline.id,
+      pipeline_name: pipeline.name,
+      statuses: (pipeline._embedded?.statuses || []).map(status => ({
+        status_id: status.id,
+        status_name: status.name
+      }))
+    }));
+    
+    res.json({
+      success: true,
+      pipelines: result,
+      hint: 'Найдите нужный статус и добавьте в Railway: AMOCRM_SPAM_PIPELINE_ID и AMOCRM_SPAM_STATUS_ID'
+    });
+    
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.response?.data || error.message
+    });
+  }
+});
+
+/**
  * Health check / Status
  * GET /
  */
@@ -642,6 +688,7 @@ app.get('/', (req, res) => {
       'POST /webhook/check-spam': 'Основной webhook (phone, lead_id)',
       'POST /webhook/amocrm': 'Webhook в формате amoCRM',
       'GET /test/check?phone=X': 'Тест проверки номера',
+      'GET /api/pipelines': 'Список воронок и статусов amoCRM',
       'GET /': 'Health check (эта страница)',
       'GET /health': 'Health check (для мониторинга)'
     }
