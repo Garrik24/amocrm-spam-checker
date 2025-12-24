@@ -374,23 +374,73 @@ app.post('/webhook/amocrm', async (req, res) => {
   try {
     log.info('📨 Получен webhook от amoCRM', req.body);
     
-    // amoCRM отправляет данные в формате leads[add][0], leads[update][0] и т.д.
+    // amoCRM отправляет данные в разных форматах
     const leads = req.body.leads;
     
     if (!leads) {
       return res.status(200).json({ status: 'ok', message: 'No leads data' });
     }
     
-    // Обрабатываем добавленные или обновленные лиды
-    const leadsToProcess = leads.add || leads.update || [];
+    // Обрабатываем все возможные типы событий
+    const leadsToProcess = leads.add || leads.update || leads.status || [];
     
-    for (const lead of leadsToProcess) {
-      const leadId = lead.id;
-      // Пытаемся найти телефон в кастомных полях или контактах
-      // Это зависит от вашей настройки amoCRM
-      const phone = lead.custom_fields?.find(f => f.name === 'Телефон')?.values?.[0]?.value;
+    // Преобразуем в массив если это объект
+    const leadsArray = Array.isArray(leadsToProcess) ? leadsToProcess : [leadsToProcess];
+    
+    for (const lead of leadsArray) {
+      // Извлекаем ID сделки (может быть в разных полях)
+      const leadId = lead.id || lead.lead_id;
+      
+      if (!leadId) {
+        log.info('Lead ID не найден, пропускаем');
+        continue;
+      }
+      
+      // Пытаемся найти телефон из разных источников
+      let phone = null;
+      
+      // 1. Из custom_fields (массив объектов)
+      if (lead.custom_fields && Array.isArray(lead.custom_fields)) {
+        const phoneField = lead.custom_fields.find(f => 
+          f.name === 'Телефон' || f.code === 'PHONE' || f.id === 'phone'
+        );
+        phone = phoneField?.values?.[0]?.value;
+      }
+      
+      // 2. Из custom_fields_values (новый формат API v4)
+      if (!phone && lead.custom_fields_values && Array.isArray(lead.custom_fields_values)) {
+        const phoneField = lead.custom_fields_values.find(f => 
+          f.field_name === 'Телефон' || f.field_code === 'PHONE'
+        );
+        phone = phoneField?.values?.[0]?.value;
+      }
+      
+      // 3. Напрямую из поля phone
+      if (!phone && lead.phone) {
+        phone = lead.phone;
+      }
+      
+      // 4. Из контактов (если есть)
+      if (!phone && lead.contacts && lead.contacts.length > 0) {
+        const contact = lead.contacts[0];
+        if (contact.phone) {
+          phone = contact.phone;
+        }
+      }
+      
+      // Если телефон не найден, попробуем получить из amoCRM API
+      if (!phone) {
+        log.info(`Телефон не найден в webhook для сделки ${leadId}, пробуем получить из API...`);
+        try {
+          phone = await getPhoneFromLead(leadId);
+        } catch (err) {
+          log.error(`Не удалось получить телефон для сделки ${leadId}:`, err.message);
+        }
+      }
       
       if (phone && leadId) {
+        log.info(`Проверяем номер: ${phone} для сделки ${leadId}`);
+        
         // Проверяем асинхронно
         checkSpam(phone).then(async (spamResult) => {
           if (spamResult.isSpam) {
@@ -399,6 +449,8 @@ app.post('/webhook/amocrm', async (req, res) => {
             await addNoteToLead(leadId, formatCleanNote(spamResult));
           }
         }).catch(err => log.error('Async processing error:', err.message));
+      } else {
+        log.info(`Недостаточно данных: phone=${phone}, leadId=${leadId}`);
       }
     }
     
@@ -410,6 +462,57 @@ app.post('/webhook/amocrm', async (req, res) => {
     res.status(200).json({ status: 'error', message: error.message });
   }
 });
+
+/**
+ * Получить телефон из сделки через API amoCRM
+ */
+async function getPhoneFromLead(leadId) {
+  try {
+    // Получаем сделку с контактами
+    const response = await axios.get(
+      `${config.amocrm.domain}/api/v4/leads/${leadId}?with=contacts`,
+      {
+        headers: {
+          'Authorization': `Bearer ${config.amocrm.accessToken}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 10000
+      }
+    );
+    
+    const lead = response.data;
+    const contacts = lead._embedded?.contacts || [];
+    
+    if (contacts.length > 0) {
+      // Получаем первый контакт
+      const contactId = contacts[0].id;
+      const contactResponse = await axios.get(
+        `${config.amocrm.domain}/api/v4/contacts/${contactId}`,
+        {
+          headers: {
+            'Authorization': `Bearer ${config.amocrm.accessToken}`,
+            'Content-Type': 'application/json'
+          },
+          timeout: 10000
+        }
+      );
+      
+      const contact = contactResponse.data;
+      const phoneField = contact.custom_fields_values?.find(f => 
+        f.field_code === 'PHONE' || f.field_name === 'Телефон'
+      );
+      
+      if (phoneField && phoneField.values && phoneField.values.length > 0) {
+        return phoneField.values[0].value;
+      }
+    }
+    
+    return null;
+  } catch (error) {
+    log.error('Ошибка получения телефона из API:', error.message);
+    return null;
+  }
+}
 
 /**
  * Тестовый endpoint - проверить номер без записи в amoCRM
