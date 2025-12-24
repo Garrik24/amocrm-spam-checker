@@ -27,9 +27,13 @@ const config = {
   amocrm: {
     domain: process.env.AMOCRM_DOMAIN || 'https://stavgeo26.amocrm.ru',
     accessToken: process.env.AMOCRM_ACCESS_TOKEN,
-    // ID статуса "СПАМ" в вашей воронке (нужно заменить на реальный)
+    // ID статуса "на удаление" для спама (опционально)
     spamStatusId: parseInt(process.env.AMOCRM_SPAM_STATUS_ID) || 0,
-    spamPipelineId: parseInt(process.env.AMOCRM_SPAM_PIPELINE_ID) || 0
+    spamPipelineId: parseInt(process.env.AMOCRM_SPAM_PIPELINE_ID) || 0,
+    // Название тега для спама
+    spamTagName: process.env.AMOCRM_SPAM_TAG_NAME || 'спам',
+    // Режим обработки спама: 'tag' (только тег), 'status' (только статус), 'both' (и тег и статус)
+    spamAction: process.env.AMOCRM_SPAM_ACTION || 'tag'
   },
   // Порог спама (0-100). Если spamScore > этого значения, считаем спамом
   spamThreshold: parseInt(process.env.SPAM_THRESHOLD) || 50,
@@ -124,18 +128,53 @@ async function checkSpam(phone) {
 }
 
 /**
- * Перевести сделку в статус "СПАМ" в amoCRM
+ * Добавить тег "спам" к сделке в amoCRM
+ * @param {number} leadId - ID сделки
+ */
+async function addSpamTagToLead(leadId) {
+  log.info(`Добавляем тег "${config.amocrm.spamTagName}" к сделке ${leadId}...`);
+  
+  try {
+    await axios.patch(
+      `${config.amocrm.domain}/api/v4/leads/${leadId}`,
+      {
+        _embedded: {
+          tags: [
+            { name: config.amocrm.spamTagName }
+          ]
+        }
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${config.amocrm.accessToken}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 10000
+      }
+    );
+    
+    log.success(`Тег "${config.amocrm.spamTagName}" добавлен к сделке ${leadId}`);
+    return true;
+    
+  } catch (error) {
+    log.error('Ошибка добавления тега:', error.response?.data || error.message);
+    throw error;
+  }
+}
+
+/**
+ * Перевести сделку в статус "на удаление" в amoCRM
  * @param {number} leadId - ID сделки
  * @param {Object} spamInfo - Информация о спаме
  */
 async function moveLeadToSpamStatus(leadId, spamInfo) {
-  log.info(`Переводим сделку ${leadId} в статус СПАМ...`);
+  log.info(`Переводим сделку ${leadId} в статус "на удаление"...`);
   
   try {
     // Проверяем, что у нас есть необходимые ID
     if (!config.amocrm.spamStatusId || !config.amocrm.spamPipelineId) {
-      log.error('Не настроены AMOCRM_SPAM_STATUS_ID и AMOCRM_SPAM_PIPELINE_ID');
-      throw new Error('Не настроены ID статуса и воронки для спама');
+      log.info('ID статуса/воронки не настроены, пропускаем изменение статуса');
+      return false;
     }
     
     // 1. Обновляем статус сделки
@@ -154,17 +193,39 @@ async function moveLeadToSpamStatus(leadId, spamInfo) {
       }
     );
     
-    log.success(`Статус сделки ${leadId} обновлён`);
-    
-    // 2. Добавляем примечание с информацией о спаме
-    await addNoteToLead(leadId, formatSpamNote(spamInfo));
-    
+    log.success(`Статус сделки ${leadId} обновлён на "на удаление"`);
     return true;
     
   } catch (error) {
     log.error('Ошибка amoCRM API:', error.response?.data || error.message);
     throw new Error(`amoCRM API error: ${error.message}`);
   }
+}
+
+/**
+ * Обработать спам-сделку (добавить тег, изменить статус, добавить примечание)
+ * @param {number} leadId - ID сделки
+ * @param {Object} spamInfo - Информация о спаме
+ */
+async function handleSpamLead(leadId, spamInfo) {
+  const action = config.amocrm.spamAction;
+  
+  log.info(`Обрабатываем спам для сделки ${leadId}, режим: ${action}`);
+  
+  // Добавляем тег "спам"
+  if (action === 'tag' || action === 'both') {
+    await addSpamTagToLead(leadId);
+  }
+  
+  // Переводим в статус "на удаление"
+  if (action === 'status' || action === 'both') {
+    await moveLeadToSpamStatus(leadId, spamInfo);
+  }
+  
+  // Добавляем примечание с информацией о спаме
+  await addNoteToLead(leadId, formatSpamNote(spamInfo));
+  
+  return true;
 }
 
 /**
@@ -269,7 +330,7 @@ app.post('/webhook/check-spam', async (req, res) => {
     // 2. Обрабатываем результат
     if (spamResult.isSpam) {
       // СПАМ - переводим сделку в статус СПАМ
-      await moveLeadToSpamStatus(lead_id, spamResult);
+      await handleSpamLead(lead_id, spamResult);
       
       return res.json({
         success: true,
@@ -333,7 +394,7 @@ app.post('/webhook/amocrm', async (req, res) => {
         // Проверяем асинхронно
         checkSpam(phone).then(async (spamResult) => {
           if (spamResult.isSpam) {
-            await moveLeadToSpamStatus(leadId, spamResult);
+            await handleSpamLead(leadId, spamResult);
           } else {
             await addNoteToLead(leadId, formatCleanNote(spamResult));
           }
