@@ -213,7 +213,7 @@ async function moveLeadToSpamStatus(leadId, spamInfo) {
 }
 
 /**
- * Обработать спам-сделку (добавить тег, изменить статус, добавить примечание)
+ * Обработать спам-сделку (добавить тег, изменить статус, переименовать, добавить примечание)
  * @param {number} leadId - ID сделки
  * @param {Object} spamInfo - Информация о спаме
  */
@@ -222,20 +222,80 @@ async function handleSpamLead(leadId, spamInfo) {
   
   log.info(`Обрабатываем спам для сделки ${leadId}, режим: ${action}`);
   
-  // Добавляем тег "спам"
+  // 1. Переименовываем сделку → "СПАМ: [старое имя]"
+  await renameLeadAsSpam(leadId, spamInfo);
+  
+  // 2. Добавляем тег "спам"
   if (action === 'tag' || action === 'both') {
     await addSpamTagToLead(leadId);
   }
   
-  // Переводим в статус "на удаление"
+  // 3. Переводим в статус "на удаление"
   if (action === 'status' || action === 'both') {
     await moveLeadToSpamStatus(leadId, spamInfo);
   }
   
-  // Добавляем примечание с информацией о спаме
+  // 4. Добавляем примечание с информацией о спаме
   await addNoteToLead(leadId, formatSpamNote(spamInfo));
   
   return true;
+}
+
+/**
+ * Переименовать сделку как СПАМ
+ * @param {number} leadId - ID сделки
+ * @param {Object} spamInfo - Информация о спаме
+ */
+async function renameLeadAsSpam(leadId, spamInfo) {
+  try {
+    log.info(`Переименовываем сделку ${leadId}...`);
+    
+    // Сначала получаем текущее название сделки
+    const response = await axios.get(
+      `${config.amocrm.domain}/api/v4/leads/${leadId}`,
+      {
+        headers: {
+          'Authorization': `Bearer ${config.amocrm.accessToken}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 10000
+      }
+    );
+    
+    const currentName = response.data.name || '';
+    
+    // Проверяем, не переименована ли уже
+    if (currentName.startsWith('СПАМ:') || currentName.startsWith('СПАМ :')) {
+      log.info(`Сделка ${leadId} уже помечена как СПАМ`);
+      return true;
+    }
+    
+    // Новое имя: "СПАМ: +79001234567 (старое имя)"
+    const newName = `СПАМ: +${spamInfo.phone} (${currentName})`;
+    
+    // Обновляем название
+    await axios.patch(
+      `${config.amocrm.domain}/api/v4/leads/${leadId}`,
+      {
+        name: newName
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${config.amocrm.accessToken}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 10000
+      }
+    );
+    
+    log.success(`Сделка ${leadId} переименована: "${newName}"`);
+    return true;
+    
+  } catch (error) {
+    log.error('Ошибка переименования сделки:', error.response?.data || error.message);
+    // Не бросаем ошибку, продолжаем обработку
+    return false;
+  }
 }
 
 /**
