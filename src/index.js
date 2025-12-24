@@ -93,30 +93,40 @@ async function checkSpam(phone) {
       }
     );
     
-    const result = response.data?.results?.[0] || {};
+    // SpravPortal API возвращает данные в формате: { phones: [...] }
+    const result = response.data?.phones?.[0] || {};
+    
+    log.info('Ответ SpravPortal API:', JSON.stringify(result));
+    
+    // Определяем спам по полю action
+    // action может быть: "Block", "Spam", "Allow", "Unknown"
+    const isSpamAction = ['Block', 'Spam', 'block', 'spam'].includes(result.action);
+    
+    // Категории спама (массив строк)
+    const categories = result.categories || [];
+    const categoryName = categories.length > 0 ? categories.join(', ') : 'Неизвестно';
+    
+    // Информация о телефоне
+    const phoneInfo = result.phoneInfo || {};
     
     const spamResult = {
       phone: phoneClean,
-      isSpam: result.isSpam || false,
-      spamScore: result.spamScore || 0,
-      category: result.category || 'unknown',
-      categoryName: result.categoryName || 'Неизвестно',
+      isSpam: isSpamAction,
+      action: result.action || 'Unknown',
+      spamScore: isSpamAction ? 100 : 0, // Если Block/Spam - 100%, иначе 0%
+      category: categories[0] || 'unknown',
+      categoryName: categoryName,
       reviewsCount: result.reviewsCount || 0,
-      organization: result.organization?.name || null,
-      region: result.phoneInfo?.region || null,
-      operator: result.phoneInfo?.operator || null,
+      organization: result.organization || null,
+      region: phoneInfo.regionTranslit || phoneInfo.region || null,
+      operator: phoneInfo.operatorTranslit || phoneInfo.operator || null,
       raw: result
     };
     
-    // Определяем статус на основе порога
-    if (spamResult.spamScore >= config.spamThreshold) {
-      spamResult.isSpam = true;
-    }
-    
     if (spamResult.isSpam) {
-      log.spam(`СПАМ обнаружен! Score: ${spamResult.spamScore}%, Категория: ${spamResult.categoryName}`);
+      log.spam(`🚫 СПАМ обнаружен! Action: ${spamResult.action}, Категория: ${spamResult.categoryName}`);
     } else {
-      log.clean(`Номер чистый. Score: ${spamResult.spamScore}%`);
+      log.clean(`✅ Номер чистый. Action: ${spamResult.action}`);
     }
     
     return spamResult;
@@ -266,9 +276,8 @@ function formatSpamNote(spamInfo) {
   return `🚫 СПАМ-НОМЕР ОБНАРУЖЕН
 
 📞 Номер: +${spamInfo.phone}
-📊 Оценка спама: ${spamInfo.spamScore}%
+⛔ Статус: ${spamInfo.action} (ЗАБЛОКИРОВАТЬ)
 📁 Категория: ${spamInfo.categoryName}
-💬 Отзывов: ${spamInfo.reviewsCount}
 ${spamInfo.organization ? `🏢 Организация: ${spamInfo.organization}` : ''}
 ${spamInfo.region ? `📍 Регион: ${spamInfo.region}` : ''}
 ${spamInfo.operator ? `📱 Оператор: ${spamInfo.operator}` : ''}
