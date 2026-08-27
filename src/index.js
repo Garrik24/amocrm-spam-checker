@@ -21,7 +21,10 @@ const config = {
   // SpravPortal API
   spravportal: {
     url: 'https://b2b-api-stage-05.spravportal.ru/whocalls/check',
-    apiKey: process.env.SPRAVPORTAL_API_KEY || 'test-X1R7B8VQM2KC'
+    apiKey: process.env.SPRAVPORTAL_API_KEY || 'test-X1R7B8VQM2KC',
+    // Версия ML-модели: 2.11-ent — enterprise-preview, открыта для нашего аккаунта (август 2026).
+    // Откат на стабильную '2.7' — через переменную SPRAVPORTAL_ML_MODEL, без правки кода
+    mlModelVer: process.env.SPRAVPORTAL_ML_MODEL || '2.11-ent'
   },
   // amoCRM
   amocrm: {
@@ -84,7 +87,8 @@ async function checkSpam(phone) {
         params: {
           allowOrganizations: true,
           showPhoneInfo: true,
-          showOrganization: true
+          showOrganization: true,
+          mlModelVer: config.spravportal.mlModelVer
         }
       },
       {
@@ -95,7 +99,12 @@ async function checkSpam(phone) {
     
     // SpravPortal API возвращает данные в формате: { phones: [...] }
     const result = response.data?.phones?.[0] || {};
-    
+
+    const mlVersion = response.headers['x-api-mlversion'];
+    if (mlVersion) log.info(`ML-модель SpravPortal: ${mlVersion}`);
+    const mlWarning = response.headers['x-api-mlversionwarning'];
+    if (mlWarning) log.info(`⚠️ X-API-MLVersionWarning: ${mlWarning}`);
+
     log.info('Ответ SpravPortal API:', JSON.stringify(result));
     
     // Определяем спам по полю action
@@ -680,6 +689,7 @@ app.get('/', (req, res) => {
     timestamp: new Date().toISOString(),
     config: {
       spravportal: config.spravportal.url,
+      mlModelVer: config.spravportal.mlModelVer,
       amocrm: config.amocrm.domain,
       spamThreshold: config.spamThreshold,
       spamStatusConfigured: !!(config.amocrm.spamStatusId && config.amocrm.spamPipelineId)
@@ -714,6 +724,7 @@ app.listen(config.port, () => {
 ║                                                                ║
 ║   📍 Порт: ${String(config.port).padEnd(48)}║
 ║   📞 SpravPortal API: ${config.spravportal.url.substring(0, 35).padEnd(35)}║
+║   🧠 ML-модель: ${String(config.spravportal.mlModelVer).padEnd(43)}║
 ║   🏢 amoCRM: ${config.amocrm.domain.padEnd(45)}║
 ║   🎯 Порог спама: ${String(config.spamThreshold + '%').padEnd(42)}║
 ║                                                                ║
