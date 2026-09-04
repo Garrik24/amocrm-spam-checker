@@ -38,6 +38,11 @@ const config = {
     // Режим обработки спама: 'tag' (только тег), 'status' (только статус), 'both' (и тег и статус)
     spamAction: process.env.AMOCRM_SPAM_ACTION || 'tag'
   },
+  // Проверка по базе Kaspersky Who Calls силами воркера на маке
+  whocalls: {
+    workerKey: process.env.WHOCALLS_WORKER_KEY || '',
+    widgetKey: process.env.WHOCALLS_WIDGET_KEY || ''
+  },
   // Порог спама (0-100). Если spamScore > этого значения, считаем спамом
   spamThreshold: parseInt(process.env.SPAM_THRESHOLD) || 50,
   port: process.env.PORT || 3000
@@ -154,13 +159,23 @@ async function addSpamTagToLead(leadId) {
   log.info(`Добавляем тег "${config.amocrm.spamTagName}" к сделке ${leadId}...`);
   
   try {
+    // PATCH перезаписывает список тегов целиком, поэтому сначала читаем текущие,
+    // иначе теряются рабочие пометки менеджеров
+    const current = await axios.get(
+      `${config.amocrm.domain}/api/v4/leads/${leadId}`,
+      { headers: { 'Authorization': `Bearer ${config.amocrm.accessToken}` }, timeout: 10000 }
+    );
+    const existing = (current.data?._embedded?.tags || []).map(t => ({ name: t.name }));
+    if (existing.some(t => t.name === config.amocrm.spamTagName)) {
+      log.info(`Тег "${config.amocrm.spamTagName}" уже стоит на сделке ${leadId}`);
+      return true;
+    }
+
     await axios.patch(
       `${config.amocrm.domain}/api/v4/leads/${leadId}`,
       {
         _embedded: {
-          tags: [
-            { name: config.amocrm.spamTagName }
-          ]
+          tags: [...existing, { name: config.amocrm.spamTagName }]
         }
       },
       {
@@ -703,6 +718,203 @@ app.get('/api/pipelines', async (req, res) => {
  * Health check / Status
  * GET /
  */
+// ==================== ПРОВЕРКА ПО БАЗЕ KASPERSKY WHO CALLS ====================
+
+/**
+ * Сайт Касперского отдаёт вердикт только настоящему браузеру: в headless
+ * капча не проходит и данные не подгружаются вовсе. Поэтому сама проверка
+ * живёт на маке (воркер с обычным Chrome), а Railway работает почтовым
+ * ящиком: кнопка в карточке кладёт задание, воркер его забирает и возвращает
+ * вердикт, разбор последствий снова здесь.
+ *
+ * Очередь держим в памяти: задания живут минуты, а перезапуск сервиса
+ * означает лишь то, что менеджеру надо нажать кнопку ещё раз.
+ */
+const JOB_TTL_MS = 15 * 60 * 1000;
+const jobs = new Map();
+
+function pruneJobs() {
+  const now = Date.now();
+  for (const [id, job] of jobs) {
+    if (now - job.createdAt > JOB_TTL_MS) jobs.delete(id);
+  }
+}
+
+function keyOk(req, expected) {
+  if (!expected) return true; // ключ не задан — не мешаем локальной отладке
+  const given = req.get('X-Api-Key') || req.query.key || req.body?.key;
+  return given === expected;
+}
+
+/**
+ * Завершить все открытые задачи сделки — чтобы спам не висел у менеджера в делах
+ */
+async function closeLeadTasks(leadId) {
+  const auth = { 'Authorization': `Bearer ${config.amocrm.accessToken}`, 'Content-Type': 'application/json' };
+  const res = await axios.get(`${config.amocrm.domain}/api/v4/tasks`, {
+    headers: auth,
+    params: { 'filter[entity_type]': 'leads', 'filter[entity_id]': leadId, 'filter[is_completed]': 0, limit: 250 },
+    timeout: 10000,
+    validateStatus: st => st === 200 || st === 204
+  });
+
+  const tasks = res.data?._embedded?.tasks || [];
+  if (!tasks.length) {
+    log.info(`Открытых задач по сделке ${leadId} нет`);
+    return 0;
+  }
+
+  await axios.patch(
+    `${config.amocrm.domain}/api/v4/tasks`,
+    tasks.map(t => ({ id: t.id, is_completed: true, result: { text: 'Спам-номер, сделка закрыта' } })),
+    { headers: auth, timeout: 10000 }
+  );
+
+  log.success(`Закрыто задач по сделке ${leadId}: ${tasks.length}`);
+  return tasks.length;
+}
+
+function formatKasperskyNote(phone, verdict, category) {
+  const stamp = `⏰ Проверено: ${new Date().toLocaleString('ru-RU')}\n🔍 Источник: Kaspersky Who Calls`;
+  if (verdict === 'spam') {
+    return `🚫 СПАМ ПО БАЗЕ КАСПЕРСКОГО\n\n📞 Номер: +${phone}\n` +
+           `${category ? `📁 Категория: ${category}\n` : ''}` +
+           `\nСделка закрыта, задачи завершены, статус изменён на «на удаление».\n\n${stamp}`;
+  }
+  if (verdict === 'clean') {
+    return `✅ НЕ СПАМ ПО БАЗЕ КАСПЕРСКОГО\n\n📞 Номер: +${phone}\n` +
+           `${category ? `📁 Категория: ${category}\n` : ''}` +
+           `\nЖалоб на номер нет — можно работать со сделкой.\n\n${stamp}`;
+  }
+  return `❔ КАСПЕРСКИЙ НЕ ЗНАЕТ ЭТОТ НОМЕР\n\n📞 Номер: +${phone}\n\n` +
+         `Жалоб не поступало, но и подтверждения тоже нет — решение за вами.\n\n${stamp}`;
+}
+
+/**
+ * Разбор вердикта: при спаме гасим сделку целиком, иначе просто пишем результат
+ */
+async function applyKasperskyVerdict(leadId, phone, verdict, category) {
+  if (verdict === 'spam') {
+    await renameLeadAsSpam(leadId, { phone });
+    await addSpamTagToLead(leadId);
+    await moveLeadToSpamStatus(leadId, { phone });
+    await closeLeadTasks(leadId);
+    await addNoteToLead(leadId, formatKasperskyNote(phone, verdict, category));
+    return 'Спам. Сделка закрыта и переведена в статус «на удаление»';
+  }
+
+  await addNoteToLead(leadId, formatKasperskyNote(phone, verdict, category));
+  return verdict === 'clean'
+    ? 'Жалоб на номер нет — можно работать'
+    : 'Касперский не знает этот номер, решение за вами';
+}
+
+/**
+ * Кнопка в карточке сделки: поставить номер в очередь на проверку
+ * POST /api/whocalls/check  { lead_id, phone? }
+ */
+app.post('/api/whocalls/check', async (req, res) => {
+  if (!keyOk(req, config.whocalls.widgetKey)) {
+    return res.status(403).json({ success: false, error: 'Неверный ключ' });
+  }
+
+  const leadId = parseInt(req.body.lead_id);
+  if (!leadId) return res.status(400).json({ success: false, error: 'Не передан lead_id' });
+
+  try {
+    const phone = cleanPhone(req.body.phone) || cleanPhone(await getPhoneFromLead(leadId));
+    if (!phone) return res.status(404).json({ success: false, error: 'У сделки не найден номер телефона' });
+
+    pruneJobs();
+
+    // Тот же номер уже в работе — не плодим задания на повторные нажатия
+    for (const [id, job] of jobs) {
+      if (job.leadId === leadId && (job.status === 'pending' || job.status === 'in_progress')) {
+        return res.json({ success: true, job_id: id, status: job.status, phone });
+      }
+    }
+
+    const jobId = `${leadId}-${Date.now().toString(36)}`;
+    jobs.set(jobId, { leadId, phone, status: 'pending', createdAt: Date.now(), verdict: null, message: null });
+    log.info(`📋 Задание на проверку у Касперского: сделка ${leadId}, номер ${phone}`);
+
+    return res.json({ success: true, job_id: jobId, status: 'pending', phone });
+  } catch (error) {
+    log.error('Ошибка постановки задания:', error.response?.data || error.message);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * Воркер на маке забирает очередное задание
+ * GET /api/whocalls/next?key=...
+ */
+app.get('/api/whocalls/next', (req, res) => {
+  if (!keyOk(req, config.whocalls.workerKey)) {
+    return res.status(403).json({ success: false, error: 'Неверный ключ' });
+  }
+
+  pruneJobs();
+  for (const [id, job] of jobs) {
+    if (job.status === 'pending') {
+      job.status = 'in_progress';
+      job.takenAt = Date.now();
+      return res.json({ success: true, job: { job_id: id, phone: job.phone, lead_id: job.leadId } });
+    }
+  }
+  return res.json({ success: true, job: null });
+});
+
+/**
+ * Воркер вернул вердикт: spam | clean | unknown
+ * POST /api/whocalls/result  { job_id, verdict, category?, error? }
+ */
+app.post('/api/whocalls/result', async (req, res) => {
+  if (!keyOk(req, config.whocalls.workerKey)) {
+    return res.status(403).json({ success: false, error: 'Неверный ключ' });
+  }
+
+  const { job_id, verdict, category, error } = req.body;
+  const job = jobs.get(job_id);
+  if (!job) return res.status(404).json({ success: false, error: 'Задание не найдено или устарело' });
+
+  if (error) {
+    job.status = 'error';
+    job.message = `Проверка не удалась: ${error}`;
+    log.error(`Воркер вернул ошибку по сделке ${job.leadId}: ${error}`);
+    return res.json({ success: true });
+  }
+
+  try {
+    job.verdict = verdict;
+    job.message = await applyKasperskyVerdict(job.leadId, job.phone, verdict, category);
+    job.status = 'done';
+    log[verdict === 'spam' ? 'spam' : 'success'](`Касперский по сделке ${job.leadId}: ${job.message}`);
+    return res.json({ success: true });
+  } catch (e) {
+    job.status = 'error';
+    job.message = `Вердикт получен (${verdict}), но amoCRM не принял изменения: ${e.message}`;
+    log.error('Ошибка применения вердикта:', e.response?.data || e.message);
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/**
+ * Виджет опрашивает статус задания
+ * GET /api/whocalls/status/:jobId
+ */
+app.get('/api/whocalls/status/:jobId', (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ success: false, error: 'Задание не найдено или устарело' });
+  return res.json({
+    success: true,
+    status: job.status,
+    verdict: job.verdict,
+    phone: job.phone,
+    message: job.message
+  });
+});
+
 app.get('/', (req, res) => {
   res.json({
     status: 'ok',
