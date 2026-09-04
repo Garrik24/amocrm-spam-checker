@@ -339,6 +339,18 @@ async function addNoteToLead(leadId, noteText) {
 }
 
 /**
+ * Ссылка на карточку номера в Kaspersky Who Calls.
+ *
+ * База Касперского наполняется независимо от SpravPortal и нередко знает
+ * свежий спам-номер раньше. Автоматически её опросить нельзя — сайт закрыт
+ * капчей, а REST API продаётся только по договору. Поэтому даём менеджеру
+ * ссылку: одно нажатие вместо звонка спамеру.
+ */
+function kasperskyCheckUrl(phone) {
+  return `https://whocalls.kaspersky.ru/info/${phone}`;
+}
+
+/**
  * Форматирование примечания для СПАМ-номера
  */
 function formatSpamNote(spamInfo) {
@@ -368,7 +380,17 @@ ${phoneInfo.region ? `📍 Регион: ${phoneInfo.region}` : ''}
 ${phoneInfo.operator ? `📱 Оператор: ${phoneInfo.operator}` : ''}
 
 ⏰ Проверено: ${new Date().toLocaleString('ru-RU')}
-🔍 Источник: SpravPortal API`;
+🔍 Источник: SpravPortal API
+
+━━━━━━━━━━━━━━━━━━━━
+❓ ВТОРОЕ МНЕНИЕ — ПЕРЕД ТЕМ КАК ПЕРЕЗВАНИВАТЬ
+
+База SpravPortal узнаёт свежие спам-номера не сразу, поэтому
+«чисто» здесь ещё не гарантия. Проверьте номер у Касперского:
+
+${kasperskyCheckUrl(phoneInfo.phone)}
+
+Если там «СПАМ» — не перезванивайте, переведите сделку в статус «Спам».`;
 }
 
 // ==================== ENDPOINTS ====================
