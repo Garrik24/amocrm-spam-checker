@@ -16,6 +16,19 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// Виджет в карточке сделки живёт на домене amoCRM и ходит сюда кросс-доменно
+app.use((req, res, next) => {
+  const origin = req.get('Origin') || '';
+  if (/^https:\/\/[a-z0-9-]+\.amocrm\.(ru|com)$/i.test(origin) || /^https:\/\/[a-z0-9-]+\.kommo\.com$/i.test(origin)) {
+    res.set('Access-Control-Allow-Origin', origin);
+    res.set('Access-Control-Allow-Headers', 'Content-Type, X-Api-Key');
+    res.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.set('Vary', 'Origin');
+  }
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 // ==================== КОНФИГУРАЦИЯ ====================
 const config = {
   // SpravPortal API
