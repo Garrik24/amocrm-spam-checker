@@ -745,6 +745,7 @@ app.get('/api/pipelines', async (req, res) => {
  */
 const JOB_TTL_MS = 15 * 60 * 1000;
 const jobs = new Map();
+let lastWorkerPollAt = null; // когда воркер последний раз выходил на связь
 
 function pruneJobs() {
   const now = Date.now();
@@ -823,6 +824,44 @@ async function applyKasperskyVerdict(leadId, phone, verdict, category) {
 }
 
 /**
+ * Диагностика связки: на связи ли воркер и что происходит с заданиями.
+ * GET /api/whocalls/health?key=...
+ */
+app.get('/api/whocalls/health', (req, res) => {
+  if (!keyOk(req, config.whocalls.workerKey)) {
+    return res.status(403).json({ success: false, error: 'Неверный ключ' });
+  }
+
+  const now = Date.now();
+  const list = [...jobs.entries()].map(([id, j]) => ({
+    job_id: id,
+    lead_id: j.leadId,
+    phone: j.phone,
+    status: j.status,
+    verdict: j.verdict,
+    message: j.message,
+    age_sec: Math.round((now - j.createdAt) / 1000)
+  }));
+
+  return res.json({
+    success: true,
+    worker: {
+      online: lastWorkerPollAt !== null && now - lastWorkerPollAt < 30000,
+      last_poll_sec_ago: lastWorkerPollAt === null ? null : Math.round((now - lastWorkerPollAt) / 1000)
+    },
+    jobs: {
+      total: list.length,
+      pending: list.filter(j => j.status === 'pending').length,
+      in_progress: list.filter(j => j.status === 'in_progress').length,
+      done: list.filter(j => j.status === 'done').length,
+      error: list.filter(j => j.status === 'error').length,
+      list: list.slice(-10)
+    },
+    uptime_sec: Math.round(process.uptime())
+  });
+});
+
+/**
  * Кнопка в карточке сделки: поставить номер в очередь на проверку
  * POST /api/whocalls/check  { lead_id, phone? }
  */
@@ -867,6 +906,7 @@ app.get('/api/whocalls/next', (req, res) => {
     return res.status(403).json({ success: false, error: 'Неверный ключ' });
   }
 
+  lastWorkerPollAt = Date.now();
   pruneJobs();
   for (const [id, job] of jobs) {
     if (job.status === 'pending') {
