@@ -494,100 +494,227 @@ app.post('/webhook/check-spam', async (req, res) => {
   }
 });
 
+// Повторные вебхуки amoCRM (сразу, +1м, +5м, +15м) не должны плодить примечания
+const LEAD_DEDUP_TTL_MS = 30 * 60 * 1000;
+const leadProcessing = new Set();
+const leadProcessedAt = new Map();
+
+function markLeadProcessed(leadId) {
+  leadProcessedAt.set(String(leadId), Date.now());
+}
+
+function wasLeadProcessedRecently(leadId) {
+  const key = String(leadId);
+  const processedAt = leadProcessedAt.get(key);
+  if (!processedAt) return false;
+  if (Date.now() - processedAt >= LEAD_DEDUP_TTL_MS) {
+    leadProcessedAt.delete(key);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Первая попытка и ещё до двух повторов (паузы 1с и 2с). Последняя ошибка пробрасывается.
+ */
+async function withAmoRetry(action, label) {
+  const retryDelays = [1000, 2000];
+  const maxAttempts = retryDelays.length + 1;
+  let lastError;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await action();
+    } catch (error) {
+      lastError = error;
+      log.error(
+        `${label}: попытка ${attempt}/${maxAttempts} не удалась:`,
+        error.response?.data || error.message
+      );
+      if (attempt < maxAttempts) {
+        await new Promise(resolve => setTimeout(resolve, retryDelays[attempt - 1]));
+      }
+    }
+  }
+
+  throw lastError;
+}
+
+/**
+ * Телефон из тела вебхука amoCRM (без запроса в API).
+ */
+function extractPhoneFromWebhookLead(lead) {
+  if (lead.custom_fields && Array.isArray(lead.custom_fields)) {
+    const phoneField = lead.custom_fields.find(f =>
+      f.name === 'Телефон' || f.code === 'PHONE' || f.id === 'phone'
+    );
+    if (phoneField?.values?.[0]?.value) return phoneField.values[0].value;
+  }
+
+  if (lead.custom_fields_values && Array.isArray(lead.custom_fields_values)) {
+    const phoneField = lead.custom_fields_values.find(f =>
+      f.field_name === 'Телефон' || f.field_code === 'PHONE'
+    );
+    if (phoneField?.values?.[0]?.value) return phoneField.values[0].value;
+  }
+
+  if (lead.phone) return lead.phone;
+
+  if (lead.contacts && lead.contacts.length > 0 && lead.contacts[0].phone) {
+    return lead.contacts[0].phone;
+  }
+
+  return null;
+}
+
+/**
+ * Уже есть примечание SpravPortal («НОМЕР ПРОВЕРЕН» / «СПАМ-НОМЕР» — как в formatCleanNote и formatSpamNote).
+ * 204 и пустое тело — примечаний нет.
+ */
+async function leadHasExistingCheckNote(leadId) {
+  const response = await withAmoRetry(
+    () => axios.get(
+      `${config.amocrm.domain}/api/v4/leads/${leadId}/notes`,
+      {
+        params: { limit: 100, 'order[created_at]': 'desc' },
+        headers: {
+          'Authorization': `Bearer ${config.amocrm.accessToken}`
+        },
+        timeout: 10000,
+        validateStatus: status => status === 200 || status === 204
+      }
+    ),
+    `Чтение примечаний сделки ${leadId}`
+  );
+
+  if (response.status === 204 || !response.data || typeof response.data !== 'object') {
+    return false;
+  }
+
+  const notes = response.data._embedded?.notes;
+  if (!Array.isArray(notes)) return false;
+
+  return notes.some(note => {
+    const text = note?.params?.text;
+    return typeof text === 'string' &&
+      (text.includes('НОМЕР ПРОВЕРЕН') || text.includes('СПАМ-НОМЕР'));
+  });
+}
+
+async function skipIfLeadAlreadyChecked(leadId, when) {
+  try {
+    if (await leadHasExistingCheckNote(leadId)) {
+      log.info(`У сделки ${leadId} уже есть примечание о проверке (${when}), пропускаем`);
+      markLeadProcessed(leadId);
+      return true;
+    }
+  } catch (err) {
+    log.error(`Не удалось прочитать примечания сделки ${leadId} (${when}):`, err.message);
+  }
+  return false;
+}
+
+/**
+ * Проверка одной сделки из вебхука amoCRM. Ответ клиенту уже отправлен.
+ */
+async function processAmoLeadFromWebhook(lead) {
+  const leadId = lead.id || lead.lead_id;
+
+  if (!leadId) {
+    log.info('Lead ID не найден, пропускаем');
+    return;
+  }
+
+  const key = String(leadId);
+  if (leadProcessing.has(key) || wasLeadProcessedRecently(leadId)) {
+    log.info(`Сделка ${leadId} уже обрабатывается или проверена за последние 30 минут, пропускаем`);
+    return;
+  }
+
+  try {
+    leadProcessing.add(key);
+
+    let phone = extractPhoneFromWebhookLead(lead);
+
+    if (!phone) {
+      log.info(`Телефон не найден в webhook для сделки ${leadId}, пробуем получить из API...`);
+      try {
+        phone = await withAmoRetry(
+          () => getPhoneFromLead(leadId),
+          `Получение телефона сделки ${leadId}`
+        );
+      } catch (err) {
+        log.error(`Не удалось получить телефон для сделки ${leadId}:`, err.message);
+      }
+    }
+
+    if (!(phone && leadId)) {
+      log.info(`Недостаточно данных: phone=${phone}, leadId=${leadId}`);
+      return;
+    }
+
+    log.info(`Проверяем номер: ${phone} для сделки ${leadId}`);
+
+    if (await skipIfLeadAlreadyChecked(leadId, 'до проверки')) return;
+
+    const spamResult = await checkSpam(phone);
+
+    if (await skipIfLeadAlreadyChecked(leadId, 'перед записью')) return;
+
+    if (spamResult.isSpam) {
+      await withAmoRetry(
+        () => handleSpamLead(leadId, spamResult),
+        `Обработка спама сделки ${leadId}`
+      );
+    } else {
+      await withAmoRetry(
+        () => addNoteToLead(leadId, formatCleanNote(spamResult)),
+        `Примечание к сделке ${leadId}`
+      );
+    }
+
+    markLeadProcessed(leadId);
+  } finally {
+    leadProcessing.delete(key);
+  }
+}
+
 /**
  * Webhook для amoCRM Digital Pipeline (формат amoCRM)
  * POST /webhook/amocrm
+ *
+ * amoCRM обрывает соединение примерно через 1.5с и ретраит тот же вебхук,
+ * поэтому 200 отдаём сразу, а проверку номера делаем после ответа.
  */
 app.post('/webhook/amocrm', async (req, res) => {
   try {
     log.info('📨 Получен webhook от amoCRM', req.body);
-    
+
     // amoCRM отправляет данные в разных форматах
     const leads = req.body.leads;
-    
+
     if (!leads) {
       return res.status(200).json({ status: 'ok', message: 'No leads data' });
     }
-    
+
     // Обрабатываем все возможные типы событий
     const leadsToProcess = leads.add || leads.update || leads.status || [];
-    
+
     // Преобразуем в массив если это объект
     const leadsArray = Array.isArray(leadsToProcess) ? leadsToProcess : [leadsToProcess];
-    
-    for (const lead of leadsArray) {
-      // Извлекаем ID сделки (может быть в разных полях)
-      const leadId = lead.id || lead.lead_id;
-      
-      if (!leadId) {
-        log.info('Lead ID не найден, пропускаем');
-        continue;
-      }
-      
-      // Пытаемся найти телефон из разных источников
-      let phone = null;
-      
-      // 1. Из custom_fields (массив объектов)
-      if (lead.custom_fields && Array.isArray(lead.custom_fields)) {
-        const phoneField = lead.custom_fields.find(f => 
-          f.name === 'Телефон' || f.code === 'PHONE' || f.id === 'phone'
-        );
-        phone = phoneField?.values?.[0]?.value;
-      }
-      
-      // 2. Из custom_fields_values (новый формат API v4)
-      if (!phone && lead.custom_fields_values && Array.isArray(lead.custom_fields_values)) {
-        const phoneField = lead.custom_fields_values.find(f => 
-          f.field_name === 'Телефон' || f.field_code === 'PHONE'
-        );
-        phone = phoneField?.values?.[0]?.value;
-      }
-      
-      // 3. Напрямую из поля phone
-      if (!phone && lead.phone) {
-        phone = lead.phone;
-      }
-      
-      // 4. Из контактов (если есть)
-      if (!phone && lead.contacts && lead.contacts.length > 0) {
-        const contact = lead.contacts[0];
-        if (contact.phone) {
-          phone = contact.phone;
-        }
-      }
-      
-      // Если телефон не найден, попробуем получить из amoCRM API
-      if (!phone) {
-        log.info(`Телефон не найден в webhook для сделки ${leadId}, пробуем получить из API...`);
-        try {
-          phone = await getPhoneFromLead(leadId);
-        } catch (err) {
-          log.error(`Не удалось получить телефон для сделки ${leadId}:`, err.message);
-        }
-      }
-      
-      if (phone && leadId) {
-        log.info(`Проверяем номер: ${phone} для сделки ${leadId}`);
-        
-        // Проверяем асинхронно
-        checkSpam(phone).then(async (spamResult) => {
-          if (spamResult.isSpam) {
-            await handleSpamLead(leadId, spamResult);
-          } else {
-            await addNoteToLead(leadId, formatCleanNote(spamResult));
-          }
-        }).catch(err => log.error('Async processing error:', err.message));
-      } else {
-        log.info(`Недостаточно данных: phone=${phone}, leadId=${leadId}`);
-      }
-    }
-    
-    // Отвечаем быстро, обработка идёт асинхронно
+
     res.status(200).json({ status: 'ok' });
-    
+
+    for (const lead of leadsArray) {
+      processAmoLeadFromWebhook(lead).catch(err =>
+        log.error('Ошибка обработки сделки из webhook amoCRM:', err.message)
+      );
+    }
   } catch (error) {
     log.error('Ошибка обработки amoCRM webhook:', error.message);
-    res.status(200).json({ status: 'error', message: error.message });
+    if (!res.headersSent) {
+      res.status(200).json({ status: 'error', message: error.message });
+    }
   }
 });
 
@@ -638,7 +765,7 @@ async function getPhoneFromLead(leadId) {
     return null;
   } catch (error) {
     log.error('Ошибка получения телефона из API:', error.message);
-    return null;
+    throw error;
   }
 }
 
